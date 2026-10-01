@@ -17,6 +17,7 @@ package main
 import (
 	"context"
 	stderrors "errors"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -1204,10 +1205,10 @@ func TestRunGPUReadinessProbesOverlap(t *testing.T) {
 	}
 }
 
-// TestRuntimeRequiredTaints pins the gate derivation: the operator Deployment's
-// RUNTIME_REQUIRED_TAINT env plus the legacy default; the chart defaults when
-// the Deployment or env is absent; fail closed on any other read error or an
-// unparseable value.
+// TestRuntimeRequiredTaints verifies runtimeRequiredTaints returns the
+// configured taint plus the legacy default, the chart defaults when the
+// Deployment or env is absent, and an error on a list error, several matching
+// Deployments, or an unparseable value.
 func TestRuntimeRequiredTaints(t *testing.T) {
 	t.Parallel()
 
@@ -1219,7 +1220,7 @@ func TestRuntimeRequiredTaints(t *testing.T) {
 		name       string
 		objects    []runtime.Object
 		refs       []recipe.ComponentRef
-		getErr     error
+		listErr    error
 		want       []corev1.Taint
 		wantErrSub string
 	}{
@@ -1290,33 +1291,42 @@ func TestRuntimeRequiredTaints(t *testing.T) {
 			wantErrSub: "valueFrom",
 		},
 		{
-			// The VR reference clusters install nodewright out of band with no
-			// fullnameOverride, so the chart's own Deployment name is what is
-			// live. Reading only the bundle name would fall back to chart
-			// defaults and gate on a taint this operator never applies.
-			name: "out-of-band Deployment name is honored",
+			// A bundle renders the skyhook-operator name. An install with no
+			// fullnameOverride renders the chart's own. The gate must find the
+			// Deployment under either, or under any other name.
+			name: "Deployment is found by label whatever its name",
 			objects: []runtime.Object{nodewrightOperatorDeploymentNamed(ns,
-				nodewrightOperatorDeploymentOutOfBand, "custom.io/gate=true:NoExecute")},
+				"nodewright-controller-manager", "custom.io/gate=true:NoExecute")},
 			refs: []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
 			want: dedupeTaints(custom, legacyRuntimeRequiredTaint),
 		},
 		{
+			name: "Deployment without the controller labels is ignored",
+			objects: []runtime.Object{func() *appsv1.Deployment {
+				d := nodewrightOperatorDeploymentWithEnv(ns, custom.ToString())
+				d.Labels = map[string]string{"control-plane": "controller-manager"}
+				return d
+			}()},
+			refs: []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
+			want: defaultsGate,
+		},
+		{
 			// Neither can be shown to own the taint the nodes carry, and
 			// picking one would gate on a value the other never applies.
-			name: "both Deployment names present fails closed",
+			name: "more than one matching Deployment fails closed",
 			objects: []runtime.Object{
 				nodewrightOperatorDeploymentWithEnv(ns, "custom.io/gate=true:NoExecute"),
-				nodewrightOperatorDeploymentNamed(ns, nodewrightOperatorDeploymentOutOfBand,
+				nodewrightOperatorDeploymentNamed(ns, "nodewright-controller-manager",
 					"other.io/gate=true:NoSchedule"),
 			},
 			refs:       []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
 			wantErrSub: "cannot tell which operator governs",
 		},
 		{
-			name:       "non-NotFound read error fails closed",
-			getErr:     apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, nodewrightOperatorDeployment, stderrors.New("forbidden")),
+			name:       "list error fails closed",
+			listErr:    apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, "", stderrors.New("forbidden")),
 			refs:       []recipe.ComponentRef{{Name: nodewrightOperatorComponent, Namespace: ns}},
-			wantErrSub: "failed to read Deployment",
+			wantErrSub: "failed to list nodewright controller-manager Deployments",
 		},
 	}
 
@@ -1325,9 +1335,9 @@ func TestRuntimeRequiredTaints(t *testing.T) {
 			t.Parallel()
 
 			clientset := k8sfake.NewClientset(tt.objects...)
-			if tt.getErr != nil {
-				clientset.PrependReactor("get", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
-					return true, nil, tt.getErr
+			if tt.listErr != nil {
+				clientset.PrependReactor("list", "deployments", func(clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, tt.listErr
 				})
 			}
 			ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
@@ -2056,7 +2066,8 @@ func nodewrightOperatorDeploymentNamed(namespace, name, taintStr string) *appsv1
 }
 
 func nodewrightOperatorDeploymentWithEnv(namespace, taintStr string) *appsv1.Deployment {
-	d := readyDeployment(namespace, nodewrightOperatorDeployment)
+	d := readyDeployment(namespace, "skyhook-operator-controller-manager")
+	d.Labels = maps.Clone(nodewrightControllerLabels)
 	container := corev1.Container{Name: "manager"}
 	if taintStr != "" {
 		container.Env = []corev1.EnvVar{{Name: runtimeRequiredTaintEnv, Value: taintStr}}
@@ -2070,7 +2081,8 @@ func nodewrightOperatorDeploymentWithEnv(namespace, taintStr string) *appsv1.Dep
 // shapes nodewrightOperatorDeploymentWithEnv cannot: present but empty, and
 // sourced from valueFrom. Both are distinct from the env being absent.
 func nodewrightOperatorDeploymentWithEnvVar(namespace string, env corev1.EnvVar) *appsv1.Deployment {
-	d := readyDeployment(namespace, nodewrightOperatorDeployment)
+	d := readyDeployment(namespace, "skyhook-operator-controller-manager")
+	d.Labels = maps.Clone(nodewrightControllerLabels)
 	d.Spec.Template.Spec.Containers = []corev1.Container{{Name: "manager", Env: []corev1.EnvVar{env}}}
 	return d
 }

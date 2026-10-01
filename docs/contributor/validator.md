@@ -1484,14 +1484,17 @@ into the validator image):
 - **`--workload-gate` is the exception, honored via the cluster.** The bundler
   writes the taint into the nodewright-operator values
   (`controllerManager.manager.env.runtimeRequiredTaint`), which the chart
-  renders as the `RUNTIME_REQUIRED_TAINT` env on the
-  `skyhook-operator-controller-manager` Deployment. The Go readiness check
-  reads that env from the live Deployment (`runtimeRequiredTaints`) and gates
+  renders as the `RUNTIME_REQUIRED_TAINT` env on the controller-manager
+  Deployment. The Go readiness check finds that Deployment by its
+  `app.kubernetes.io/name=nodewright,control-plane=controller-manager` labels,
+  so the name an install renders does not matter, reads the env from it
+  (`runtimeRequiredTaints`), and gates
   on exactly that taint plus the legacy `skyhook.nvidia.com=runtime-required:NoSchedule`
   the operator still removes during its deprecation window, so an arbitrary
   key, value, or effect passed at bundle time is what the validator waits to
   see cleared. When the Deployment or env is absent it falls back to the two
-  chart defaults; any other read error fails closed.
+  chart defaults. A list error or more than one matching Deployment fails
+  closed.
 - **`--data`-external files referenced by path are not readable in the Job.**
   A component whose `manifestFiles` or base `valuesFile` exist only in an
   external `--data` directory cannot be read by the embedded-only validator

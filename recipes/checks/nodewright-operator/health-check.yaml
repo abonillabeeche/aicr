@@ -24,8 +24,9 @@
 #    (resolveNodewrightGVR) fails closed when the recipe pins v0.18.0+ and
 #    that group is not served, so its absence is never mistaken for a
 #    legacy operator.
-# 2. skyhook-operator-controller-manager Deployment has at least one
-#    available replica.
+# 2. The controller-manager Deployment, matched by label so it holds whether
+#    or not the install sets fullnameOverride, has at least one available
+#    replica.
 # 3. No pods stuck in Pending/Failed/Unknown phases or known-bad
 #    container-waiting states.
 apiVersion: chainsaw.kyverno.io/v1alpha1
@@ -54,8 +55,10 @@ spec:
               apiVersion: apps/v1
               kind: Deployment
               metadata:
-                name: skyhook-operator-controller-manager
                 namespace: nodewright
+                labels:
+                  app.kubernetes.io/name: nodewright
+                  control-plane: controller-manager
               status:
                 (availableReplicas > `0`): true
     - name: validate-all-pods-healthy

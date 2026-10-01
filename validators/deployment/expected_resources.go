@@ -40,6 +40,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
 )
@@ -84,21 +85,19 @@ const (
 	nicClusterPolicyManifestMarker = "nic-cluster-policy"
 )
 
-// The nodewright operator's controller-manager Deployment (name fixed by
-// fullnameOverride in recipes/components/nodewright-operator/values.yaml) and
-// the container env carrying its configured workload-gate taint.
+// The nodewright operator component and the container env carrying its
+// workload-gate taint.
 const (
 	nodewrightOperatorComponent = "nodewright-operator"
-	// nodewrightOperatorDeployment is the name a bundle renders, via
-	// components/nodewright-operator/values.yaml's fullnameOverride.
-	nodewrightOperatorDeployment = "skyhook-operator-controller-manager"
-	// nodewrightOperatorDeploymentOutOfBand is the chart's own default name,
-	// which an install that sets no fullnameOverride renders. The VR reference
-	// clusters are installed that way (NVIDIA/aicr#1828), so both names are
-	// live and the gate cannot assume either one.
-	nodewrightOperatorDeploymentOutOfBand = "nodewright-controller-manager"
-	runtimeRequiredTaintEnv               = "RUNTIME_REQUIRED_TAINT"
+	runtimeRequiredTaintEnv     = "RUNTIME_REQUIRED_TAINT"
 )
+
+// nodewrightControllerLabels select the operator's controller-manager
+// Deployment whatever name the install renders.
+var nodewrightControllerLabels = labels.Set{
+	"app.kubernetes.io/name": "nodewright",
+	"control-plane":          "controller-manager",
+}
 
 // nodewrightRenameVersion is the first nodewright-operator release that serves
 // nodewright.nvidia.com and writes status only there.
@@ -942,19 +941,18 @@ func nodewrightStatusFailure(verifyCtx context.Context, dynClient dynamic.Interf
 }
 
 // runtimeRequiredTaints returns the workload-gate taints the deployment gate
-// waits to see cleared: the operator's configured taint, read from the
-// runtimeRequiredTaintEnv on its controller-manager Deployment, plus
-// legacyRuntimeRequiredTaint. Reading the live Deployment is what lets a
-// --workload-gate value reach the gate: the bundler writes it into the
-// operator's values, never into the recipe the validator Job is handed. The
-// Deployment is looked up in the nodewright-operator component's namespace
-// when the recipe carries that component, else in fallbackNamespace.
+// waits to see cleared: the taint configured on the operator's
+// controller-manager Deployment, plus legacyRuntimeRequiredTaint. The
+// Deployment is looked up in the namespace of the nodewright-operator
+// component in refs, else in fallbackNamespace.
 //
-// When the Deployment or the env is absent the gate falls back to
-// defaultRuntimeRequiredTaint and legacyRuntimeRequiredTaint. Any other Get
-// error fails closed: "could not read the operator's config" must never be
-// read as "no taint to wait for".
+// It returns defaultRuntimeRequiredTaint and legacyRuntimeRequiredTaint when
+// the Deployment or its env is absent, and an error when the Deployments
+// cannot be listed, more than one matches, or the configured taint is unusable.
 func runtimeRequiredTaints(ctx *validators.Context, refs []recipe.ComponentRef, fallbackNamespace string) ([]corev1.Taint, error) {
+	// The bundler writes --workload-gate into the operator's values, never
+	// into the recipe the validator Job is handed, so the live Deployment is
+	// the only place the gate reaches this check.
 	namespace := fallbackNamespace
 	if opRef, ok := findEnabledComponent(refs, nodewrightOperatorComponent); ok && opRef.Namespace != "" {
 		namespace = opRef.Namespace
@@ -968,40 +966,27 @@ func runtimeRequiredTaints(ctx *validators.Context, refs []recipe.ComponentRef, 
 	getCtx, cancel := ctx.Timeout(defaults.ResourceVerificationTimeout)
 	defer cancel()
 
-	// Both supported install paths are probed rather than assuming the bundle
-	// rendered the name: an out-of-band install sets no fullnameOverride and
-	// renders the chart default, and reading the wrong one falls back to chart
-	// defaults while the live operator is gating on a taint nobody configured
-	// here. A non-NotFound read fails closed, as before.
-	var (
-		found     *appsv1.Deployment
-		deployRef string
-	)
-	for _, name := range []string{nodewrightOperatorDeployment, nodewrightOperatorDeploymentOutOfBand} {
-		ref := namespace + "/" + name
-		deploy, err := ctx.Clientset.AppsV1().Deployments(namespace).Get(getCtx, name, metav1.GetOptions{})
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				return nil, errors.Wrap(errors.ErrCodeInternal,
-					fmt.Sprintf("failed to read Deployment %s for the nodewright runtime-required taint gate", ref), err)
-			}
-			continue
-		}
-		if found != nil {
-			// Two operators in one namespace: neither can be shown to own the
-			// taint the nodes carry, and picking one would gate on a value the
-			// other never applies.
-			return nil, errors.New(errors.ErrCodeConflict,
-				fmt.Sprintf("both %s and %s exist in namespace %s; cannot tell which operator governs the runtime-required taint",
-					nodewrightOperatorDeployment, nodewrightOperatorDeploymentOutOfBand, namespace))
-		}
-		found, deployRef = deploy, ref
+	list, err := ctx.Clientset.AppsV1().Deployments(namespace).List(getCtx,
+		metav1.ListOptions{LabelSelector: nodewrightControllerLabels.String()})
+	if err != nil {
+		// Fail closed. An unreadable config must not read as no taint to wait for.
+		return nil, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("failed to list nodewright controller-manager Deployments in namespace %s for the runtime-required taint gate", namespace), err)
 	}
-	if found == nil {
-		return chartDefaults(fmt.Sprintf("no %s or %s Deployment in namespace %s",
-			nodewrightOperatorDeployment, nodewrightOperatorDeploymentOutOfBand, namespace)), nil
+	switch len(list.Items) {
+	case 0:
+		return chartDefaults(fmt.Sprintf("no Deployment matching %s in namespace %s",
+			nodewrightControllerLabels, namespace)), nil
+	case 1:
+	default:
+		// Neither operator can be shown to own the taint the nodes carry, and
+		// picking one would gate on a value the other never applies.
+		return nil, errors.New(errors.ErrCodeConflict,
+			fmt.Sprintf("%d Deployments match %s in namespace %s; cannot tell which operator governs the runtime-required taint",
+				len(list.Items), nodewrightControllerLabels, namespace))
 	}
-	deploy := found
+	deploy := &list.Items[0]
+	deployRef := namespace + "/" + deploy.Name
 
 	for i := range deploy.Spec.Template.Spec.Containers {
 		for _, env := range deploy.Spec.Template.Spec.Containers[i].Env {
